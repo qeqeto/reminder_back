@@ -11,7 +11,10 @@ const { sendEmail } = require('./notify');
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || true }));
 app.use(express.json());
+// Public health endpoint used by the frontend to distinguish an offline API from bad credentials.
+app.get('/api/health', (_, res) => res.json({ ok: true, service: 'reminder-api' }));
 const SECRET = process.env.JWT_SECRET || 'change-me';
+if (process.env.NODE_ENV === 'production' && SECRET === 'change-me') console.warn('WARNING: set a strong JWT_SECRET in Railway variables.');
 
 const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ error: e.message }));
 const hash = pw => { const salt = crypto.randomBytes(8).toString('hex'); return salt + ':' + crypto.scryptSync(pw, salt, 32).toString('hex'); };

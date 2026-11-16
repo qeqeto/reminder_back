@@ -83,6 +83,32 @@ app.get('/api/verify/status', pending, wrap(async (req, res) => {
   res.json(rows[0]?.verified ? { verified: true, ...(rows[0].approved ? { token: sign({ role: 'user', id: req.uid }) } : { waiting: true }) } : { verified: false });
 }));
 
+// --- Telegram Mini App: ავტორიზაცია Telegram-ის initData ხელმოწერით ---
+async function tgUser(initData) {
+  const fail = (status, msg) => Object.assign(new Error(msg), { status });
+  const { TELEGRAM_BOT_TOKEN: tok } = await getSettings();
+  if (!tok || !initData) throw fail(401, 'გახსენი ფორმა ბოტიდან (/new)');
+  const p = new URLSearchParams(initData), h = p.get('hash'); p.delete('hash');
+  const dcs = [...p.entries()].map(([k, v]) => `${k}=${v}`).sort().join('\n');
+  const calc = crypto.createHmac('sha256', crypto.createHmac('sha256', 'WebAppData').update(tok).digest()).update(dcs).digest('hex');
+  if (!h || h.length !== calc.length || !crypto.timingSafeEqual(Buffer.from(h), Buffer.from(calc)) || Date.now() / 1000 - +p.get('auth_date') > 86400)
+    throw fail(401, 'ავტორიზაცია ვერ მოხერხდა, გახსენი ფორმა თავიდან');
+  const { rows } = await pool.query('SELECT id,name FROM users WHERE telegram_chat_id=$1 AND verified AND approved', [JSON.parse(p.get('user')).id]);
+  if (!rows[0]) throw fail(403, 'წვდომა არ გაქვს. ფორმა მხოლოდ დამტკიცებული მომხმარებლებისთვისაა');
+  return rows[0];
+}
+const tgWrap = fn => (req, res) => fn(req, res).catch(e => res.status(e.status || 500).json({ error: e.message }));
+app.post('/api/tg/form', tgWrap(async (req, res) => {
+  const me = await tgUser(req.body.initData);
+  res.json({ me, users: (await pool.query('SELECT id,name FROM users WHERE verified AND approved ORDER BY name')).rows });
+}));
+app.post('/api/tg/documents', tgWrap(async (req, res) => {
+  const me = await tgUser(req.body.initData);
+  if (!req.body.title?.trim()) throw Object.assign(new Error('ჩაწერე დოკუმენტის სახელი'), { status: 400 });
+  const id = await save(null, { role: 'user', id: me.id }, req.body);
+  res.json({ id, results: req.body.notify ? await notifyDoc(id, me.name) : null });
+}));
+
 app.use('/api', (req, res, next) => {
   try { req.auth = jwt.verify(bearer(req), SECRET); if (!['admin', 'user'].includes(req.auth.role)) throw 0; next(); }
   catch { bad(res, 401, 'საჭიროა შესვლა'); }

@@ -14,7 +14,7 @@ async function runReminders() {
     JOIN document_users du ON du.document_id = d.id
     JOIN users u ON u.id = du.user_id
     CROSS JOIN LATERAL unnest(d.remind_mins) AS t(m)
-    WHERE NOT d.done AND u.verified
+    WHERE NOT d.done AND u.verified AND u.approved
       AND now() >= d.deadline - (t.m * interval '1 minute')
       AND now() <  d.deadline - (t.m * interval '1 minute') + interval '90 minutes'`, [TZ]);
 
@@ -48,7 +48,7 @@ async function notifyDoc(docId, byName) {
     SELECT d.title, to_char(d.deadline AT TIME ZONE $1,'DD.MM.YYYY HH24:MI') deadline_txt, d.deadline,
            u.name, u.email, u.telegram_chat_id
     FROM documents d JOIN document_users du ON du.document_id=d.id JOIN users u ON u.id=du.user_id
-    WHERE d.id=$2 AND u.verified`, [TZ, docId]);
+    WHERE d.id=$2 AND u.verified AND u.approved`, [TZ, docId]);
   const results = [];
   for (const r of rows) {
     const text = `გამარჯობა, ${r.name}!\n\n${byName} გახსენებს დოკუმენტს: "${r.title}"\nგადაგზავნის ვადა: ${r.deadline_txt}.`;

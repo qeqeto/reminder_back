@@ -6,7 +6,7 @@ const { pool, init } = require('./db');
 const { startBot } = require('./bot');
 const { runReminders, notifyDoc } = require('./cron');
 const { KEYS, SECRET: SECRETS, getSettings, setSetting } = require('./settings');
-const { sendEmail } = require('./notify');
+const { sendEmail, sendTelegram } = require('./notify');
 
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || true }));
@@ -30,9 +30,10 @@ app.post('/api/login', wrap(async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD)
     return res.json({ token: sign({ role: 'admin', id: 0 }) });
-  const { rows } = await pool.query('SELECT id,password_hash,verified FROM users WHERE lower(email)=lower($1)', [email || '']);
+  const { rows } = await pool.query('SELECT id,password_hash,verified,approved FROM users WHERE lower(email)=lower($1)', [email || '']);
   if (!rows[0] || !verify(password || '', rows[0].password_hash)) return bad(res, 401, 'არასწორი ელფოსტა ან პაროლი');
   if (!rows[0].verified) return bad(res, 403, 'ანგარიში ჯერ დაუდასტურებელია', { pending: sign({ scope: 'verify', id: rows[0].id }, '15m'), methods: await methods() });
+  if (!rows[0].approved) return bad(res, 403, 'ანგარიში დადასტურებულია, მაგრამ ჯერ ადმინის დამტკიცებას ელოდება');
   res.json({ token: sign({ role: 'user', id: rows[0].id }) });
 }));
 
@@ -41,7 +42,7 @@ app.post('/api/register', wrap(async (req, res) => {
   const { name, email, password } = req.body;
   if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(email || '')) return bad(res, 400, 'შეავსე სახელი და სწორი ელფოსტა');
   if (!password || password.length < 8) return bad(res, 400, 'პაროლი მინიმუმ 8 სიმბოლო უნდა იყოს');
-  const { rows } = await pool.query('INSERT INTO users (name,email,password_hash,link_code,verified) VALUES ($1,$2,$3,$4,false) RETURNING id',
+  const { rows } = await pool.query('INSERT INTO users (name,email,password_hash,link_code,verified,approved) VALUES ($1,$2,$3,$4,false,false) RETURNING id',
     [name.trim(), email.trim(), hash(password), crypto.randomBytes(5).toString('hex')]);
   res.json({ pending: sign({ scope: 'verify', id: rows[0].id }, '15m'), methods: await methods() });
 }));
@@ -67,8 +68,8 @@ app.post('/api/verify/email/confirm', pending, wrap(async (req, res) => {
   if (u.verify_attempts >= 5) return bad(res, 429, 'ცდები ამოიწურა, გამოითხოვე ახალი კოდი');
   const h = crypto.createHash('sha256').update(String(req.body.code || '').trim() + ':' + req.uid).digest('hex');
   if (h !== u.verify_code) { await pool.query('UPDATE users SET verify_attempts=verify_attempts+1 WHERE id=$1', [req.uid]); return bad(res, 400, 'კოდი არასწორია'); }
-  await pool.query('UPDATE users SET verified=true, verify_code=NULL WHERE id=$1', [req.uid]);
-  res.json({ token: sign({ role: 'user', id: req.uid }) });
+  const a = await pool.query('UPDATE users SET verified=true, verify_code=NULL WHERE id=$1 RETURNING approved', [req.uid]);
+  res.json(a.rows[0].approved ? { token: sign({ role: 'user', id: req.uid }) } : { waiting: true });
 }));
 app.post('/api/verify/telegram/start', pending, wrap(async (req, res) => {
   const s = await getSettings();
@@ -78,8 +79,8 @@ app.post('/api/verify/telegram/start', pending, wrap(async (req, res) => {
   res.json({ link: `https://t.me/${s.TELEGRAM_BOT_USERNAME}?start=v_${t}` });
 }));
 app.get('/api/verify/status', pending, wrap(async (req, res) => {
-  const { rows } = await pool.query('SELECT verified FROM users WHERE id=$1', [req.uid]);
-  res.json(rows[0]?.verified ? { verified: true, token: sign({ role: 'user', id: req.uid }) } : { verified: false });
+  const { rows } = await pool.query('SELECT verified,approved FROM users WHERE id=$1', [req.uid]);
+  res.json(rows[0]?.verified ? { verified: true, ...(rows[0].approved ? { token: sign({ role: 'user', id: req.uid }) } : { waiting: true }) } : { verified: false });
 }));
 
 // --- Telegram Mini App: ავტორიზაცია Telegram-ის initData ხელმოწერით ---
@@ -92,14 +93,14 @@ async function tgUser(initData) {
   const calc = crypto.createHmac('sha256', crypto.createHmac('sha256', 'WebAppData').update(tok).digest()).update(dcs).digest('hex');
   if (!h || h.length !== calc.length || !crypto.timingSafeEqual(Buffer.from(h), Buffer.from(calc)) || Date.now() / 1000 - +p.get('auth_date') > 86400)
     throw fail(401, 'ავტორიზაცია ვერ მოხერხდა, გახსენი ფორმა თავიდან');
-  const { rows } = await pool.query('SELECT id,name FROM users WHERE telegram_chat_id=$1 AND verified', [JSON.parse(p.get('user')).id]);
-  if (!rows[0]) throw fail(403, 'ჯერ დააკავშირე Telegram შენს ანგარიშთან');
+  const { rows } = await pool.query('SELECT id,name FROM users WHERE telegram_chat_id=$1 AND verified AND approved', [JSON.parse(p.get('user')).id]);
+  if (!rows[0]) throw fail(403, 'წვდომა არ გაქვს. ფორმა მხოლოდ დამტკიცებული მომხმარებლებისთვისაა');
   return rows[0];
 }
 const tgWrap = fn => (req, res) => fn(req, res).catch(e => res.status(e.status || 500).json({ error: e.message }));
 app.post('/api/tg/form', tgWrap(async (req, res) => {
   const me = await tgUser(req.body.initData);
-  res.json({ me, users: (await pool.query('SELECT id,name FROM users ORDER BY name')).rows });
+  res.json({ me, users: (await pool.query('SELECT id,name FROM users WHERE verified AND approved ORDER BY name')).rows });
 }));
 app.post('/api/tg/documents', tgWrap(async (req, res) => {
   const me = await tgUser(req.body.initData);
@@ -117,7 +118,7 @@ const adminOnly = (req, res, next) => req.auth.role === 'admin' ? next() : bad(r
 app.get('/api/me', wrap(async (req, res) => {
   const bot = (await getSettings()).TELEGRAM_BOT_USERNAME || null;
   if (req.auth.role === 'admin') return res.json({ role: 'admin', id: 0, name: 'ადმინი', email: process.env.ADMIN_EMAIL, bot });
-  const { rows } = await pool.query('SELECT id,name,email,link_code,(telegram_chat_id IS NOT NULL) tg FROM users WHERE id=$1', [req.auth.id]);
+  const { rows } = await pool.query('SELECT id,name,email,link_code,(telegram_chat_id IS NOT NULL) tg FROM users WHERE id=$1 AND approved', [req.auth.id]);
   if (!rows[0]) return bad(res, 401, 'მომხმარებელი ვერ მოიძებნა');
   res.json({ role: 'user', bot, ...rows[0] });
 }));
@@ -133,8 +134,8 @@ app.post('/api/me/password', wrap(async (req, res) => {
 
 // --- მომხმარებლები ---
 app.get('/api/users', wrap(async (req, res) => {
-  const cols = req.auth.role === 'admin' ? 'id,name,email,link_code,verified,(telegram_chat_id IS NOT NULL) tg' : 'id,name';
-  const { rows } = await pool.query(`SELECT ${cols} FROM users ORDER BY name`);
+  const cols = req.auth.role === 'admin' ? 'id,name,email,link_code,verified,approved,(telegram_chat_id IS NOT NULL) tg' : 'id,name';
+  const { rows } = await pool.query(`SELECT ${cols} FROM users ${req.auth.role === 'admin' ? '' : 'WHERE approved AND verified'} ORDER BY name`);
   res.json({ users: rows });
 }));
 app.post('/api/users', adminOnly, wrap(async (req, res) => {
@@ -143,8 +144,15 @@ app.post('/api/users', adminOnly, wrap(async (req, res) => {
     [name, email || null, password ? hash(password) : null, crypto.randomBytes(5).toString('hex')]);
   res.json(rows[0]);
 }));
-app.post('/api/users/:id/verify', adminOnly, wrap(async (req, res) => {
-  await pool.query('UPDATE users SET verified=true WHERE id=$1', [req.params.id]); res.json({ ok: true });
+app.post('/api/users/:id/approve', adminOnly, wrap(async (req, res) => {
+  const { rows } = await pool.query('UPDATE users SET verified=true, approved=true WHERE id=$1 RETURNING name,email,telegram_chat_id', [req.params.id]);
+  const u = rows[0];
+  if (u) { // შეტყობინება დამტკიცების შესახებ (შეცდომა არ არის კრიტიკული)
+    const msg = `${u.name}, შენი ანგარიში დამტკიცდა ✅ ახლა შეგიძლია შეხვიდე სისტემაში.`;
+    if (u.telegram_chat_id) sendTelegram(u.telegram_chat_id, msg).catch(() => {});
+    if (u.email) sendEmail(u.email, 'ანგარიში დამტკიცდა', msg).catch(() => {});
+  }
+  res.json({ ok: true });
 }));
 app.delete('/api/users/:id', adminOnly, wrap(async (req, res) => {
   await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]); res.json({ ok: true });

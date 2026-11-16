@@ -45,3 +45,4 @@ CREATE TABLE IF NOT EXISTS reminder_sent (
   document_id INT REFERENCES documents(id) ON DELETE CASCADE, user_id INT, channel TEXT, offset_min INT,
   sent_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (document_id, user_id, channel, offset_min)
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT true;

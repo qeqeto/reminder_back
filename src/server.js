@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { pool, init } = require('./db');
 const { startBot } = require('./bot');
-const { runReminders } = require('./cron');
+const { runReminders, notifyDoc } = require('./cron');
 const { KEYS, SECRET: SECRETS, getSettings, setSetting } = require('./settings');
 const { sendEmail } = require('./notify');
 
@@ -124,43 +124,79 @@ app.delete('/api/users/:id', adminOnly, wrap(async (req, res) => {
   await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]); res.json({ ok: true });
 }));
 
-// --- დოკუმენტები: ყველა მომხმარებელს შეუძლია დამატება და სხვების მონიშვნა ---
+// --- დოკუმენტები: ყველას შეუძლია შექმნა და სხვების მონიშვნა; ვადა = თარიღი + დრო ---
+const canAct = `($3 OR created_by=$4 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=$2 AND x.user_id=$4))`;
 app.get('/api/documents', wrap(async (req, res) => {
   const mine = req.auth.role === 'admin' ? '' :
     'WHERE d.created_by=$1 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=d.id AND x.user_id=$1)';
   const { rows } = await pool.query(`
-    SELECT d.id,d.title,d.deadline::text deadline,d.remind_days,d.created_by,d.done,cu.name creator_name,
+    SELECT d.id,d.title,d.deadline,d.remind_mins,d.created_by,d.done,d.done_at,d.done_by_name,d.postponed_count,cu.name creator_name,
       COALESCE(array_agg(du.user_id) FILTER (WHERE du.user_id IS NOT NULL),'{}') user_ids
     FROM documents d LEFT JOIN users cu ON cu.id=d.created_by LEFT JOIN document_users du ON du.document_id=d.id
     ${mine} GROUP BY d.id,cu.name ORDER BY d.deadline`, mine ? [req.auth.id] : []);
   res.json(rows);
 }));
-async function save(id, auth, { title, deadline, remind_days, user_ids = [] }) {
+async function save(id, auth, { title, deadline, remind_mins, user_ids = [] }) {
+  const dl = deadline ? new Date(deadline) : new Date(Date.now() + 10 * 864e5); // ნაგულისხმევი: 10 დღე
+  if (isNaN(dl)) throw new Error('არასწორი თარიღი');
+  const rm = (Array.isArray(remind_mins) ? remind_mins : [4320, 1440, 60, 0]).map(Number).filter(n => Number.isInteger(n) && n >= 0);
   const c = await pool.connect();
   try {
     await c.query('BEGIN');
     if (id) {
-      const r = await c.query('UPDATE documents SET title=$1,deadline=$2,remind_days=$3 WHERE id=$4 AND ($5 OR created_by=$6)',
-        [title, deadline, remind_days, id, auth.role === 'admin', auth.id]);
+      const old = (await c.query('SELECT deadline FROM documents WHERE id=$1', [id])).rows[0];
+      const r = await c.query('UPDATE documents SET title=$1,deadline=$2,remind_mins=$3 WHERE id=$4 AND ($5 OR created_by=$6)',
+        [title, dl.toISOString(), rm, id, auth.role === 'admin', auth.id]);
       if (!r.rowCount) throw new Error('ამ დოკუმენტის შეცვლა არ შეგიძლია');
-    } else id = (await c.query('INSERT INTO documents (title,deadline,remind_days,created_by) VALUES ($1,$2,$3,$4) RETURNING id',
-      [title, deadline, remind_days, auth.id])).rows[0].id;
+      if (!old || +new Date(old.deadline) !== +dl) await c.query('DELETE FROM reminder_sent WHERE document_id=$1', [id]);
+    } else id = (await c.query('INSERT INTO documents (title,deadline,remind_mins,created_by) VALUES ($1,$2,$3,$4) RETURNING id',
+      [title, dl.toISOString(), rm, auth.id])).rows[0].id;
     await c.query('DELETE FROM document_users WHERE document_id=$1', [id]);
     for (const u of user_ids) await c.query('INSERT INTO document_users VALUES ($1,$2)', [id, u]);
     await c.query('COMMIT'); return id;
   } catch (e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
 }
-app.post('/api/documents', wrap(async (req, res) => res.json({ id: await save(null, req.auth, req.body) })));
+const nameOf = async auth => auth.role === 'admin' ? 'ადმინი' : (await pool.query('SELECT name FROM users WHERE id=$1', [auth.id])).rows[0]?.name || 'მომხმარებელი';
+app.post('/api/documents', wrap(async (req, res) => {
+  const id = await save(null, req.auth, req.body);
+  res.json({ id, results: req.body.notify ? await notifyDoc(id, await nameOf(req.auth)) : null });
+}));
+// ახლავე გაგზავნა (შემქმნელი, მონიშნული პირი ან ადმინი; 30 წამში ერთხელ თითო დავალებაზე)
+const lastNotify = new Map();
+app.post('/api/documents/:id/notify', wrap(async (req, res) => {
+  const id = +req.params.id;
+  const ok = await pool.query(`SELECT 1 FROM documents WHERE id=$1 AND ($2 OR created_by=$3 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=$1 AND x.user_id=$3))`,
+    [id, req.auth.role === 'admin', req.auth.id]);
+  if (!ok.rowCount) return bad(res, 403, 'ამ დავალებაზე უფლება არ გაქვს');
+  if (Date.now() - (lastNotify.get(id) || 0) < 30000) return bad(res, 429, 'ახლახან გაიგზავნა, მოიცადე 30 წამი');
+  lastNotify.set(id, Date.now());
+  res.json({ results: await notifyDoc(id, await nameOf(req.auth)) });
+}));
 app.put('/api/documents/:id', wrap(async (req, res) => res.json({ id: await save(req.params.id, req.auth, req.body) })));
+
+// შესრულებულად მონიშვნა: საკმარისია ერთი მონიშნული პირი (ან შემქმნელი/ადმინი)
 app.put('/api/documents/:id/done', wrap(async (req, res) => {
-  const r = await pool.query(`UPDATE documents SET done=$1 WHERE id=$2 AND ($3 OR created_by=$4 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=$2 AND x.user_id=$4))`,
-    [!!req.body.done, req.params.id, req.auth.role === 'admin', req.auth.id]);
-  if (!r.rowCount) return bad(res, 403, 'ამ დოკუმენტზე უფლება არ გაქვს');
+  const name = req.auth.role === 'admin' ? 'ადმინი' : (await pool.query('SELECT name FROM users WHERE id=$1', [req.auth.id])).rows[0]?.name;
+  const done = !!req.body.done;
+  const r = await pool.query(`UPDATE documents SET done=$1, done_at=CASE WHEN $1 THEN now() END, done_by_name=CASE WHEN $1 THEN $5::text END
+    WHERE id=$2 AND ${canAct}`, [done, req.params.id, req.auth.role === 'admin', req.auth.id, name]);
+  if (!r.rowCount) return bad(res, 403, 'ამ დავალებაზე უფლება არ გაქვს');
+  res.json({ ok: true });
+}));
+// გადადება / ვადის შეცვლა (შემქმნელი, მონიშნული პირი ან ადმინი)
+app.put('/api/documents/:id/deadline', wrap(async (req, res) => {
+  const dl = new Date(req.body.deadline);
+  if (isNaN(dl)) return bad(res, 400, 'არასწორი თარიღი');
+  const r = await pool.query(`UPDATE documents SET deadline=$1::timestamptz,
+      postponed_count = postponed_count + (CASE WHEN $1::timestamptz > deadline THEN 1 ELSE 0 END)
+    WHERE id=$2 AND ${canAct}`, [dl.toISOString(), req.params.id, req.auth.role === 'admin', req.auth.id]);
+  if (!r.rowCount) return bad(res, 403, 'ამ დავალებაზე უფლება არ გაქვს');
+  await pool.query('DELETE FROM reminder_sent WHERE document_id=$1', [req.params.id]);
   res.json({ ok: true });
 }));
 app.delete('/api/documents/:id', wrap(async (req, res) => {
   const r = await pool.query('DELETE FROM documents WHERE id=$1 AND ($2 OR created_by=$3)', [req.params.id, req.auth.role === 'admin', req.auth.id]);
-  if (!r.rowCount) return res.status(403).json({ error: 'ამ დოკუმენტის წაშლა არ შეგიძლია' });
+  if (!r.rowCount) return bad(res, 403, 'ამ დოკუმენტის წაშლა არ შეგიძლია');
   res.json({ ok: true });
 }));
 

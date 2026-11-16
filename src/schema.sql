@@ -32,3 +32,16 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_attempts INT NOT NULL DEFAULT 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS verify_sent_at TIMESTAMPTZ;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_verify_token TEXT;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS done BOOLEAN NOT NULL DEFAULT false;
+DO $$ BEGIN
+  IF (SELECT data_type FROM information_schema.columns WHERE table_name='documents' AND column_name='deadline')='date' THEN
+    ALTER TABLE documents ALTER COLUMN deadline TYPE TIMESTAMPTZ USING ((deadline + time '18:00') AT TIME ZONE 'Asia/Tbilisi');
+  END IF;
+END $$;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS remind_mins INT[] NOT NULL DEFAULT '{4320,1440,60,0}';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS done_at TIMESTAMPTZ;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS done_by_name TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS postponed_count INT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS reminder_sent (
+  document_id INT REFERENCES documents(id) ON DELETE CASCADE, user_id INT, channel TEXT, offset_min INT,
+  sent_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (document_id, user_id, channel, offset_min)
+);

@@ -11,42 +11,103 @@ const { sendEmail } = require('./notify');
 const app = express();
 app.use(cors({ origin: process.env.FRONTEND_URL || true }));
 app.use(express.json());
-// Public health endpoint used by the frontend to distinguish an offline API from bad credentials.
-app.get('/api/health', (_, res) => res.json({ ok: true, service: 'reminder-api' }));
 const SECRET = process.env.JWT_SECRET || 'change-me';
-if (process.env.NODE_ENV === 'production' && SECRET === 'change-me') console.warn('WARNING: set a strong JWT_SECRET in Railway variables.');
 
-const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(500).json({ error: e.message }));
+const wrap = fn => (req, res) => fn(req, res).catch(e => res.status(e.code === '23505' ? 409 : 500).json({ error: e.code === '23505' ? 'ეს ელფოსტა უკვე რეგისტრირებულია' : e.message }));
 const hash = pw => { const salt = crypto.randomBytes(8).toString('hex'); return salt + ':' + crypto.scryptSync(pw, salt, 32).toString('hex'); };
 const verify = (pw, h) => { if (!h) return false; const [salt, k] = h.split(':'); return crypto.timingSafeEqual(Buffer.from(k, 'hex'), crypto.scryptSync(pw, salt, 32)); };
-const sign = a => jwt.sign(a, SECRET, { expiresIn: '7d' });
+const sign = (a, exp = '7d') => jwt.sign(a, SECRET, { expiresIn: exp });
+const bearer = req => (req.headers.authorization || '').replace('Bearer ', '');
+const smtpReady = async () => { const s = await getSettings(); return !!(s.SMTP_HOST && s.SMTP_USER && s.SMTP_PASS); };
+const tgReady = async () => { const s = await getSettings(); return !!(s.TELEGRAM_BOT_TOKEN && s.TELEGRAM_BOT_USERNAME); };
+const methods = async () => ({ email: await smtpReady(), telegram: await tgReady() });
+const bad = (res, code, error, extra = {}) => res.status(code).json({ error, ...extra });
+
+app.get('/api/health', (_, res) => res.json({ ok: true, service: 'reminder-api' }));
+app.get('/api/public/config', wrap(async (_, res) => res.json(await methods())));
 
 app.post('/api/login', wrap(async (req, res) => {
   const { email, password } = req.body;
   if (email === process.env.ADMIN_EMAIL && password === process.env.ADMIN_PASSWORD)
     return res.json({ token: sign({ role: 'admin', id: 0 }) });
-  const { rows } = await pool.query('SELECT id,password_hash FROM users WHERE lower(email)=lower($1)', [email || '']);
-  if (rows[0] && verify(password || '', rows[0].password_hash)) return res.json({ token: sign({ role: 'user', id: rows[0].id }) });
-  res.status(401).json({ error: 'არასწორი მონაცემები' });
+  const { rows } = await pool.query('SELECT id,password_hash,verified FROM users WHERE lower(email)=lower($1)', [email || '']);
+  if (!rows[0] || !verify(password || '', rows[0].password_hash)) return bad(res, 401, 'არასწორი ელფოსტა ან პაროლი');
+  if (!rows[0].verified) return bad(res, 403, 'ანგარიში ჯერ დაუდასტურებელია', { pending: sign({ scope: 'verify', id: rows[0].id }, '15m'), methods: await methods() });
+  res.json({ token: sign({ role: 'user', id: rows[0].id }) });
+}));
+
+// --- თვითრეგისტრაცია და ვერიფიკაცია ---
+app.post('/api/register', wrap(async (req, res) => {
+  const { name, email, password } = req.body;
+  if (!name?.trim() || !/^\S+@\S+\.\S+$/.test(email || '')) return bad(res, 400, 'შეავსე სახელი და სწორი ელფოსტა');
+  if (!password || password.length < 8) return bad(res, 400, 'პაროლი მინიმუმ 8 სიმბოლო უნდა იყოს');
+  const { rows } = await pool.query('INSERT INTO users (name,email,password_hash,link_code,verified) VALUES ($1,$2,$3,$4,false) RETURNING id',
+    [name.trim(), email.trim(), hash(password), crypto.randomBytes(5).toString('hex')]);
+  res.json({ pending: sign({ scope: 'verify', id: rows[0].id }, '15m'), methods: await methods() });
+}));
+
+const pending = (req, res, next) => {
+  try { const a = jwt.verify(bearer(req), SECRET); if (a.scope !== 'verify') throw 0; req.uid = a.id; next(); }
+  catch { bad(res, 401, 'ვერიფიკაციის სესია ამოიწურა, შედი თავიდან'); }
+};
+app.post('/api/verify/email/send', pending, wrap(async (req, res) => {
+  if (!(await smtpReady())) return bad(res, 400, 'ელფოსტით დადასტურება ჩართული არ არის');
+  const { rows } = await pool.query('SELECT email,verify_sent_at FROM users WHERE id=$1', [req.uid]);
+  if (rows[0].verify_sent_at && Date.now() - new Date(rows[0].verify_sent_at) < 60000) return bad(res, 429, 'ახალი კოდი 1 წუთში ერთხელ შეგიძლია მოითხოვო');
+  const code = String(crypto.randomInt(100000, 1000000));
+  await pool.query(`UPDATE users SET verify_code=$1, verify_expires=now()+interval '10 minutes', verify_attempts=0, verify_sent_at=now() WHERE id=$2`,
+    [crypto.createHash('sha256').update(code + ':' + req.uid).digest('hex'), req.uid]);
+  await sendEmail(rows[0].email, 'დადასტურების კოდი', `შენი დადასტურების კოდია: ${code}\nკოდი 10 წუთის განმავლობაში მოქმედებს.`);
+  res.json({ ok: true });
+}));
+app.post('/api/verify/email/confirm', pending, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT verify_code,verify_expires,verify_attempts FROM users WHERE id=$1', [req.uid]);
+  const u = rows[0];
+  if (!u?.verify_code || new Date(u.verify_expires) < new Date()) return bad(res, 400, 'კოდი ვადაგასულია, გამოითხოვე ახალი');
+  if (u.verify_attempts >= 5) return bad(res, 429, 'ცდები ამოიწურა, გამოითხოვე ახალი კოდი');
+  const h = crypto.createHash('sha256').update(String(req.body.code || '').trim() + ':' + req.uid).digest('hex');
+  if (h !== u.verify_code) { await pool.query('UPDATE users SET verify_attempts=verify_attempts+1 WHERE id=$1', [req.uid]); return bad(res, 400, 'კოდი არასწორია'); }
+  await pool.query('UPDATE users SET verified=true, verify_code=NULL WHERE id=$1', [req.uid]);
+  res.json({ token: sign({ role: 'user', id: req.uid }) });
+}));
+app.post('/api/verify/telegram/start', pending, wrap(async (req, res) => {
+  const s = await getSettings();
+  if (!(await tgReady())) return bad(res, 400, 'Telegram-ით დადასტურება ჩართული არ არის');
+  const t = crypto.randomBytes(12).toString('hex');
+  await pool.query('UPDATE users SET tg_verify_token=$1 WHERE id=$2', [t, req.uid]);
+  res.json({ link: `https://t.me/${s.TELEGRAM_BOT_USERNAME}?start=v_${t}` });
+}));
+app.get('/api/verify/status', pending, wrap(async (req, res) => {
+  const { rows } = await pool.query('SELECT verified FROM users WHERE id=$1', [req.uid]);
+  res.json(rows[0]?.verified ? { verified: true, token: sign({ role: 'user', id: req.uid }) } : { verified: false });
 }));
 
 app.use('/api', (req, res, next) => {
-  try { req.auth = jwt.verify((req.headers.authorization || '').replace('Bearer ', ''), SECRET); next(); }
-  catch { res.status(401).json({ error: 'საჭიროა შესვლა' }); }
+  try { req.auth = jwt.verify(bearer(req), SECRET); if (!['admin', 'user'].includes(req.auth.role)) throw 0; next(); }
+  catch { bad(res, 401, 'საჭიროა შესვლა'); }
 });
-const adminOnly = (req, res, next) => req.auth.role === 'admin' ? next() : res.status(403).json({ error: 'მხოლოდ ადმინისთვის' });
+const adminOnly = (req, res, next) => req.auth.role === 'admin' ? next() : bad(res, 403, 'მხოლოდ ადმინისთვის');
 
 app.get('/api/me', wrap(async (req, res) => {
   const bot = (await getSettings()).TELEGRAM_BOT_USERNAME || null;
-  if (req.auth.role === 'admin') return res.json({ role: 'admin', id: 0, name: 'ადმინი', bot });
-  const { rows } = await pool.query('SELECT id,name,link_code,(telegram_chat_id IS NOT NULL) tg FROM users WHERE id=$1', [req.auth.id]);
-  if (!rows[0]) return res.status(401).json({ error: 'მომხმარებელი ვერ მოიძებნა' });
+  if (req.auth.role === 'admin') return res.json({ role: 'admin', id: 0, name: 'ადმინი', email: process.env.ADMIN_EMAIL, bot });
+  const { rows } = await pool.query('SELECT id,name,email,link_code,(telegram_chat_id IS NOT NULL) tg FROM users WHERE id=$1', [req.auth.id]);
+  if (!rows[0]) return bad(res, 401, 'მომხმარებელი ვერ მოიძებნა');
   res.json({ role: 'user', bot, ...rows[0] });
+}));
+app.post('/api/me/password', wrap(async (req, res) => {
+  if (req.auth.role !== 'user') return bad(res, 400, 'ადმინის პაროლი Railway Variables-ში იცვლება');
+  const { old, next } = req.body;
+  if (!next || next.length < 8) return bad(res, 400, 'ახალი პაროლი მინიმუმ 8 სიმბოლო უნდა იყოს');
+  const { rows } = await pool.query('SELECT password_hash FROM users WHERE id=$1', [req.auth.id]);
+  if (rows[0].password_hash && !verify(old || '', rows[0].password_hash)) return bad(res, 400, 'ძველი პაროლი არასწორია');
+  await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash(next), req.auth.id]);
+  res.json({ ok: true });
 }));
 
 // --- მომხმარებლები ---
 app.get('/api/users', wrap(async (req, res) => {
-  const cols = req.auth.role === 'admin' ? 'id,name,email,link_code,(telegram_chat_id IS NOT NULL) tg' : 'id,name';
+  const cols = req.auth.role === 'admin' ? 'id,name,email,link_code,verified,(telegram_chat_id IS NOT NULL) tg' : 'id,name';
   const { rows } = await pool.query(`SELECT ${cols} FROM users ORDER BY name`);
   res.json({ users: rows });
 }));
@@ -55,6 +116,9 @@ app.post('/api/users', adminOnly, wrap(async (req, res) => {
   const { rows } = await pool.query('INSERT INTO users (name,email,password_hash,link_code) VALUES ($1,$2,$3,$4) RETURNING id',
     [name, email || null, password ? hash(password) : null, crypto.randomBytes(5).toString('hex')]);
   res.json(rows[0]);
+}));
+app.post('/api/users/:id/verify', adminOnly, wrap(async (req, res) => {
+  await pool.query('UPDATE users SET verified=true WHERE id=$1', [req.params.id]); res.json({ ok: true });
 }));
 app.delete('/api/users/:id', adminOnly, wrap(async (req, res) => {
   await pool.query('DELETE FROM users WHERE id=$1', [req.params.id]); res.json({ ok: true });
@@ -65,10 +129,10 @@ app.get('/api/documents', wrap(async (req, res) => {
   const mine = req.auth.role === 'admin' ? '' :
     'WHERE d.created_by=$1 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=d.id AND x.user_id=$1)';
   const { rows } = await pool.query(`
-    SELECT d.id,d.title,d.deadline::text deadline,d.remind_days,d.created_by,
+    SELECT d.id,d.title,d.deadline::text deadline,d.remind_days,d.created_by,d.done,cu.name creator_name,
       COALESCE(array_agg(du.user_id) FILTER (WHERE du.user_id IS NOT NULL),'{}') user_ids
-    FROM documents d LEFT JOIN document_users du ON du.document_id=d.id
-    ${mine} GROUP BY d.id ORDER BY d.deadline`, mine ? [req.auth.id] : []);
+    FROM documents d LEFT JOIN users cu ON cu.id=d.created_by LEFT JOIN document_users du ON du.document_id=d.id
+    ${mine} GROUP BY d.id,cu.name ORDER BY d.deadline`, mine ? [req.auth.id] : []);
   res.json(rows);
 }));
 async function save(id, auth, { title, deadline, remind_days, user_ids = [] }) {
@@ -88,6 +152,12 @@ async function save(id, auth, { title, deadline, remind_days, user_ids = [] }) {
 }
 app.post('/api/documents', wrap(async (req, res) => res.json({ id: await save(null, req.auth, req.body) })));
 app.put('/api/documents/:id', wrap(async (req, res) => res.json({ id: await save(req.params.id, req.auth, req.body) })));
+app.put('/api/documents/:id/done', wrap(async (req, res) => {
+  const r = await pool.query(`UPDATE documents SET done=$1 WHERE id=$2 AND ($3 OR created_by=$4 OR EXISTS (SELECT 1 FROM document_users x WHERE x.document_id=$2 AND x.user_id=$4))`,
+    [!!req.body.done, req.params.id, req.auth.role === 'admin', req.auth.id]);
+  if (!r.rowCount) return bad(res, 403, 'ამ დოკუმენტზე უფლება არ გაქვს');
+  res.json({ ok: true });
+}));
 app.delete('/api/documents/:id', wrap(async (req, res) => {
   const r = await pool.query('DELETE FROM documents WHERE id=$1 AND ($2 OR created_by=$3)', [req.params.id, req.auth.role === 'admin', req.auth.id]);
   if (!r.rowCount) return res.status(403).json({ error: 'ამ დოკუმენტის წაშლა არ შეგიძლია' });

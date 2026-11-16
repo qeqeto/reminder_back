@@ -18,6 +18,12 @@ async function startBot() {
         offset = u.update_id + 1;
         const m = u.message;
         if (!m?.text) continue;
+        const vt = (m.text.match(/^\/start\s+v_(\S+)/) || [])[1];
+        if (vt) { // რეგისტრაციის ვერიფიკაცია QR/ბმულით
+          const v = await pool.query('UPDATE users SET verified=true, telegram_chat_id=$1, tg_verify_token=NULL WHERE tg_verify_token=$2 RETURNING name', [m.chat.id, vt]);
+          await sendTelegram(m.chat.id, v.rows[0] ? `${v.rows[0].name}, ანგარიში დადასტურდა ✅ შეგიძლია დაუბრუნდე საიტს.` : 'ბმული ვადაგასულია ან უკვე გამოყენებულია.');
+          continue;
+        }
         const code = (m.text.match(/^\/start\s+(\S+)/) || [])[1];
         if (!code) { await sendTelegram(m.chat.id, 'გამარჯობა! გამოიყენე ბმული ადმინისგან: /start <კოდი>'); continue; }
         const { rows } = await pool.query('UPDATE users SET telegram_chat_id=$1 WHERE link_code=$2 RETURNING name', [m.chat.id, code]);

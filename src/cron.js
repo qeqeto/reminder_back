@@ -10,7 +10,7 @@ async function runReminders() {
     FROM documents d
     JOIN document_users du ON du.document_id = d.id
     JOIN users u ON u.id = du.user_id
-    WHERE (d.deadline - (now() AT TIME ZONE 'Asia/Tbilisi')::date) = ANY(d.remind_days)`);
+    WHERE NOT d.done AND u.verified AND (d.deadline - (now() AT TIME ZONE 'Asia/Tbilisi')::date) = ANY(d.remind_days)`);
 
   const summary = [];
   for (const r of rows) {

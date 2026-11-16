@@ -22,4 +22,11 @@ async function sendTelegram(chatId, text, extra = {}) {
   });
   if (!r.ok) throw new Error('Telegram: ' + (await r.text()));
 }
-module.exports = { sendEmail, sendTelegram, tgUrl };
+async function tgCall(method, body) {
+  const { TELEGRAM_BOT_TOKEN: token } = await getSettings();
+  if (!token) throw new Error('Telegram ტოკენი არ არის გაწერილი');
+  const j = await (await fetch(`${tgUrl(token)}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).json();
+  if (!j.ok) throw new Error(j.description || 'Telegram error');
+  return j.result;
+}
+module.exports = { sendEmail, sendTelegram, tgUrl, tgCall };

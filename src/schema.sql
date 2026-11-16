@@ -46,3 +46,4 @@ CREATE TABLE IF NOT EXISTS reminder_sent (
   sent_at TIMESTAMPTZ DEFAULT now(), PRIMARY KEY (document_id, user_id, channel, offset_min)
 );
 ALTER TABLE users ADD COLUMN IF NOT EXISTS approved BOOLEAN NOT NULL DEFAULT true;
+CREATE TABLE IF NOT EXISTS bot_drafts (chat_id BIGINT PRIMARY KEY, step TEXT, data JSONB NOT NULL, msg_id INT, updated_at TIMESTAMPTZ DEFAULT now());

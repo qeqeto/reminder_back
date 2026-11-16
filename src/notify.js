@@ -13,12 +13,12 @@ async function sendEmail(to, subject, text) {
 }
 
 const tgUrl = token => `https://api.telegram.org/bot${token}`;
-async function sendTelegram(chatId, text) {
+async function sendTelegram(chatId, text, extra = {}) {
   const { TELEGRAM_BOT_TOKEN: token } = await getSettings();
   if (!token) throw new Error('Telegram ტოკენი არ არის გაწერილი');
   const r = await fetch(`${tgUrl(token)}/sendMessage`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text })
+    body: JSON.stringify({ chat_id: chatId, text, ...extra })
   });
   if (!r.ok) throw new Error('Telegram: ' + (await r.text()));
 }

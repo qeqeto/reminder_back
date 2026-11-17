@@ -1,5 +1,5 @@
 const { pool } = require('./db');
-const KEYS = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_USERNAME', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'];
+const KEYS = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_BOT_USERNAME', 'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'DEFAULT_DAILY_TIME'];
 const SECRET = ['TELEGRAM_BOT_TOKEN', 'SMTP_PASS'];
 
 // ბაზაში შენახული მნიშვნელობა უპირატესია, ENV არის სარეზერვო
